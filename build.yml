@@ -59,7 +59,7 @@ jobs:
               id 'java'
               id 'net.neoforged.moddev' version '2.0.78'
           }
-          version = '2.1.0'
+          version = '2.2.0'
           group = 'com.multibogey'
           base { archivesName = 'multibogey' }
           java.toolchain.languageVersion = JavaLanguageVersion.of(21)
@@ -91,9 +91,9 @@ jobs:
 
           [[mods]]
           modId = "multibogey"
-          version = "2.1.0"
+          version = "2.2.0"
           displayName = "Multi Bogey Trains"
-          description = '''Experimental addon for Create: aims to allow more than two bogeys per carriage and articulated, curve-following wagons.'''
+          description = '''Experimental addon for Create: more than two bogeys per assembled train section. Sections with 3+ bogeys are split into linked, articulated carriages that bend around curves.'''
           logoFile = "logo.png"
           authors = "You"
 
@@ -137,7 +137,7 @@ jobs:
             "minVersion": "0.8",
             "package": "com.multibogey.mixin",
             "compatibilityLevel": "JAVA_21",
-            "mixins": ["CarriageContraptionMixin", "StationBlockEntityMixin"],
+            "mixins": ["CarriageContraptionMixin", "ContraptionMixin", "StationBlockEntityMixin"],
             "injectors": { "defaultRequire": 1 }
           }
           EOF
@@ -154,7 +154,19 @@ jobs:
                       .comment("Maximum bogeys glued to ONE carriage (on or off the rails). Create default is 2.")
                       .defineInRange("maxBogeysPerCarriage", 8, 1, 9000);
 
+              public static final ModConfigSpec.BooleanValue ARTICULATED = B
+                      .comment("Split a glued structure with more than 2 bogeys into linked carriages (2 bogeys each) so the train bends around curves. If false, everything stays one rigid carriage.")
+                      .define("articulated", true);
+
               public static final ModConfigSpec SPEC = B.build();
+
+              public static boolean articulated() {
+                  try {
+                      return ARTICULATED.get();
+                  } catch (Throwable t) {
+                      return true;
+                  }
+              }
 
               public static int maxBogeys() {
                   try {
@@ -247,6 +259,35 @@ jobs:
           /** first bogey position of a carriage -> position of its last on-track bogey (or null). Only filled during one assembly. */
           public final class GroupOverrides {
               public static final Map<BlockPos, BlockPos> SECOND = new HashMap<>();
+
+              /** First bogey position of a carriage -> the slice of the structure (along the track) that carriage may take. Only filled during one assembly. */
+              public static final Map<BlockPos, Slab> SLABS = new HashMap<>();
+
+              /** A block belongs to the slab if lowExcl < sign*coord(axis) <= highIncl. */
+              public record Slab(net.minecraft.core.Direction.Axis axis, int sign, long lowExcl, long highIncl) {
+                  public boolean contains(BlockPos p) {
+                      long t = (long) sign * p.get(axis);
+                      return t > lowExcl && t <= highIncl;
+                  }
+              }
+
+              private static Boolean hook;
+
+              /** True if the Contraption.moveBlock hook of ContraptionMixin can apply on this Create version. */
+              public static boolean slabHookAvailable() {
+                  if (hook == null) {
+                      try {
+                          Class.forName("com.simibubi.create.content.contraptions.Contraption")
+                              .getDeclaredMethod("moveBlock", net.minecraft.world.level.Level.class,
+                                  net.minecraft.core.Direction.class, java.util.Queue.class, java.util.Set.class);
+                          hook = true;
+                      } catch (Throwable t) {
+                          hook = false;
+                      }
+                  }
+                  return hook;
+              }
+
               private GroupOverrides() {}
           }
           EOF
@@ -342,6 +383,51 @@ jobs:
           }
           EOF
 
+          cat > src/main/java/com/multibogey/mixin/ContraptionMixin.java <<'EOF'
+          package com.multibogey.mixin;
+
+          import java.util.Queue;
+          import java.util.Set;
+
+          import org.jetbrains.annotations.Nullable;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          import com.multibogey.GroupOverrides;
+          import com.simibubi.create.content.contraptions.Contraption;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.world.level.Level;
+
+          /**
+           * While a station assembles an articulated train, each carriage may only take the blocks inside
+           * its own slice of the glued structure. Blocks outside the slice are skipped here, exactly like
+           * Create skips blocks that do not need to move, and get picked up by the next carriage instead.
+           */
+          @Mixin(value = Contraption.class, remap = false)
+          public abstract class ContraptionMixin {
+              @Inject(method = "moveBlock", at = @At("HEAD"), cancellable = true, remap = false, require = 0)
+              private void multibogey$slab(Level world, @Nullable Direction forcedDirection, Queue<BlockPos> frontier,
+                                           Set<BlockPos> visited, CallbackInfoReturnable<Boolean> cir) {
+                  if (GroupOverrides.SLABS.isEmpty()) return;
+                  Contraption self = (Contraption) (Object) this;
+                  if (self.anchor == null) return;
+                  GroupOverrides.Slab slab = GroupOverrides.SLABS.get(self.anchor);
+                  if (slab == null) return;
+                  BlockPos pos = frontier.peek();
+                  if (pos == null) return;
+                  if (!slab.contains(pos)) {
+                      frontier.poll();
+                      visited.add(pos);
+                      cir.setReturnValue(true);
+                  }
+              }
+          }
+          EOF
+
           cat > src/main/java/com/multibogey/mixin/StationBlockEntityMixin.java <<'EOF'
           package com.multibogey.mixin;
 
@@ -392,6 +478,7 @@ jobs:
                   remap = false)
               private void multibogey$group(UUID playerUUID, CallbackInfo ci) {
                   GroupOverrides.SECOND.clear();
+                  GroupOverrides.SLABS.clear();
                   StationBlockEntity self = (StationBlockEntity) (Object) this;
                   Level level = self.getLevel();
                   if (level == null || bogeyLocations == null || bogeyTypes == null || upsideDownBogeys == null
@@ -415,6 +502,7 @@ jobs:
 
                   List<Integer> keep = new ArrayList<>();
                   Map<BlockPos, BlockPos> overrides = new HashMap<>();
+                  Map<BlockPos, GroupOverrides.Slab> slabs = new HashMap<>();
                   int i = 0;
                   while (i < bogeyCount) {
                       List<BlockPos> group = multibogey$probe(level, dir, pos[i]);
@@ -423,6 +511,26 @@ jobs:
                       while (last + 1 < bogeyCount && group.contains(pos[last + 1])) last++;
                       for (int j = last + 1; j < bogeyCount; j++) {
                           if (group.contains(pos[j])) return; // genuinely out of order: keep Create's error
+                      }
+                      if (last - i >= 2 && com.multibogey.Config.articulated() && GroupOverrides.slabHookAvailable()) {
+                          // Articulated: bogeys (i,i+1), (i+2,i+3), ... each become their own linked carriage.
+                          // The structure is cut halfway between bogey i+1 and i+2, i+3 and i+4, ...
+                          Direction.Axis axis = dir.getAxis();
+                          int sign = dir.getAxisDirection() == Direction.AxisDirection.POSITIVE ? 1 : -1;
+                          long lowExcl = Long.MIN_VALUE;
+                          for (int j = i; j <= last; j += 2) {
+                              long highIncl = Long.MAX_VALUE;
+                              if (j + 2 <= last) {
+                                  long t1 = (long) sign * pos[j + 1].get(axis);
+                                  long t2 = (long) sign * pos[j + 2].get(axis);
+                                  highIncl = Math.floorDiv(t1 + t2, 2L);
+                              }
+                              slabs.put(pos[j], new GroupOverrides.Slab(axis, sign, lowExcl, highIncl));
+                              lowExcl = highIncl;
+                          }
+                          for (int j = i; j <= last; j++) keep.add(j);
+                          i = last + 1;
+                          continue;
                       }
                       keep.add(i);
                       if (last != i) keep.add(last);
@@ -444,11 +552,13 @@ jobs:
                   }
                   bogeyCount = keep.size();
                   GroupOverrides.SECOND.putAll(overrides);
+                  GroupOverrides.SLABS.putAll(slabs);
               }
 
               @Inject(method = "assemble(Ljava/util/UUID;)V", at = @At("RETURN"), remap = false)
               private void multibogey$clear(UUID playerUUID, CallbackInfo ci) {
                   GroupOverrides.SECOND.clear();
+                  GroupOverrides.SLABS.clear();
               }
 
               @Unique
