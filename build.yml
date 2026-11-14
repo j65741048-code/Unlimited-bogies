@@ -1,0 +1,690 @@
+name: Build Multi Bogey Mod
+
+# Put this file at .github/workflows/build.yml in an empty GitHub repo.
+# It generates the entire mod (code, metadata, icon) and builds the jar.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Find Create version on maven
+        run: |
+          curl -fsSL https://maven.createmod.net/com/simibubi/create/create-1.21.1/maven-metadata.xml -o meta.xml
+          VER=$(grep -o '<version>6\.0\.10[^<]*</version>' meta.xml | tail -1 | sed 's/<[^>]*>//g')
+          if [ -z "$VER" ]; then VER=$(grep -o '<version>6\.0\.[^<]*</version>' meta.xml | tail -1 | sed 's/<[^>]*>//g'); fi
+          echo "Using Create $VER"
+          echo "CREATE_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/multibogey/mixin
+          mkdir -p src/main/resources/META-INF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  gradlePluginPortal()
+                  maven { url = 'https://maven.neoforged.net/releases' }
+              }
+          }
+          rootProject.name = 'multibogey'
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'java'
+              id 'net.neoforged.moddev' version '2.0.78'
+          }
+          version = '2.1.0'
+          group = 'com.multibogey'
+          base { archivesName = 'multibogey' }
+          java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+          def createVersion = project.findProperty('createVersion')
+          repositories {
+              mavenCentral()
+              maven { url = 'https://maven.neoforged.net/releases' }
+              maven { url = 'https://maven.createmod.net' }
+              maven { url = 'https://maven.ithundxr.dev/snapshots' }
+          }
+          dependencies {
+              compileOnly("com.simibubi.create:create-1.21.1:${createVersion}:slim") { transitive = false }
+              compileOnly "dev.engine-room.flywheel:flywheel-neoforge-api-1.21.1:1.0.6"
+              compileOnly "net.createmod.ponder:ponder-neoforge:1.0.82+mc1.21.1"
+              compileOnly "com.tterrag.registrate:Registrate:MC1.21-1.3.0+67"
+          }
+          neoForge {
+              version = '21.1.172'
+              mods {
+                  multibogey { sourceSet sourceSets.main }
+              }
+          }
+          EOF
+
+          cat > src/main/resources/META-INF/neoforge.mods.toml <<'EOF'
+          modLoader = "javafml"
+          loaderVersion = "[4,)"
+          license = "MIT"
+
+          [[mods]]
+          modId = "multibogey"
+          version = "2.1.0"
+          displayName = "Multi Bogey Trains"
+          description = '''Experimental addon for Create: aims to allow more than two bogeys per carriage and articulated, curve-following wagons.'''
+          logoFile = "logo.png"
+          authors = "You"
+
+          [[mixins]]
+          config = "multibogey.mixins.json"
+
+          [[dependencies.multibogey]]
+          modId = "neoforge"
+          type = "required"
+          versionRange = "[21.1,)"
+          ordering = "NONE"
+          side = "BOTH"
+
+          [[dependencies.multibogey]]
+          modId = "minecraft"
+          type = "required"
+          versionRange = "[1.21.1,1.22)"
+          ordering = "NONE"
+          side = "BOTH"
+
+          [[dependencies.multibogey]]
+          modId = "create"
+          type = "required"
+          versionRange = "[6.0.8,)"
+          ordering = "AFTER"
+          side = "BOTH"
+
+          # Create: Blocks & Bogies is required. If the game says this mod id is
+          # missing even though B&B is installed, change "create_bb" to B&B's real id.
+          [[dependencies.multibogey]]
+          modId = "create_bb"
+          type = "required"
+          versionRange = "[0,)"
+          ordering = "AFTER"
+          side = "BOTH"
+          EOF
+
+          cat > src/main/resources/multibogey.mixins.json <<'EOF'
+          {
+            "required": false,
+            "minVersion": "0.8",
+            "package": "com.multibogey.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": ["CarriageContraptionMixin", "StationBlockEntityMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/Config.java <<'EOF'
+          package com.multibogey;
+
+          import net.neoforged.neoforge.common.ModConfigSpec;
+
+          public class Config {
+              private static final ModConfigSpec.Builder B = new ModConfigSpec.Builder();
+
+              public static final ModConfigSpec.IntValue MAX_BOGEYS = B
+                      .comment("Maximum bogeys glued to ONE carriage (on or off the rails). Create default is 2.")
+                      .defineInRange("maxBogeysPerCarriage", 8, 1, 9000);
+
+              public static final ModConfigSpec SPEC = B.build();
+
+              public static int maxBogeys() {
+                  try {
+                      return MAX_BOGEYS.get();
+                  } catch (Throwable t) {
+                      return 8;
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/MultiBogey.java <<'EOF'
+          package com.multibogey;
+
+          import net.neoforged.bus.api.IEventBus;
+          import net.neoforged.fml.ModContainer;
+          import net.neoforged.fml.common.Mod;
+          import net.neoforged.fml.config.ModConfig;
+          import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          @Mod("multibogey")
+          public class MultiBogey {
+              public static final Logger LOGGER = LoggerFactory.getLogger("multibogey");
+
+              public MultiBogey(IEventBus modBus, ModContainer container) {
+                  container.registerConfig(ModConfig.Type.COMMON, Config.SPEC);
+                  modBus.addListener((FMLCommonSetupEvent e) -> e.enqueueWork(RealBogeys::register));
+                  LOGGER.info("Multi Bogey Trains loaded (experimental).");
+              }
+          }
+          EOF
+
+          # Client: open the config in Create's config screen (BaseConfigScreen),
+          # falling back to NeoForge's own config screen if it can't be found.
+          cat > src/main/java/com/multibogey/MultiBogeyClient.java <<'EOF'
+          package com.multibogey;
+
+          import net.minecraft.client.gui.screens.Screen;
+          import net.neoforged.api.distmarker.Dist;
+          import net.neoforged.fml.ModContainer;
+          import net.neoforged.fml.common.Mod;
+          import net.neoforged.neoforge.client.gui.ConfigurationScreen;
+          import net.neoforged.neoforge.client.gui.IConfigScreenFactory;
+
+          @Mod(value = "multibogey", dist = Dist.CLIENT)
+          public class MultiBogeyClient {
+              public MultiBogeyClient(ModContainer container) {
+                  container.registerExtensionPoint(IConfigScreenFactory.class,
+                          (c, parent) -> createScreen(c, parent));
+              }
+
+              private static Screen createScreen(ModContainer c, Screen parent) {
+                  String[] names = {
+                      "net.createmod.catnip.config.ui.BaseConfigScreen",
+                      "com.simibubi.create.foundation.config.ui.BaseConfigScreen"
+                  };
+                  for (String n : names) {
+                      try {
+                          return (Screen) Class.forName(n)
+                                  .getConstructor(Screen.class, String.class)
+                                  .newInstance(parent, "multibogey");
+                      } catch (Throwable ignored) {
+                      }
+                  }
+                  return new ConfigurationScreen(c, parent);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/BogeyGroupAccess.java <<'EOF'
+          package com.multibogey;
+
+          import java.util.List;
+          import net.minecraft.core.BlockPos;
+
+          public interface BogeyGroupAccess {
+              List<BlockPos> multibogey$getBogeyPositions();
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/GroupOverrides.java <<'EOF'
+          package com.multibogey;
+
+          import java.util.HashMap;
+          import java.util.Map;
+          import net.minecraft.core.BlockPos;
+
+          /** first bogey position of a carriage -> position of its last on-track bogey (or null). Only filled during one assembly. */
+          public final class GroupOverrides {
+              public static final Map<BlockPos, BlockPos> SECOND = new HashMap<>();
+              private GroupOverrides() {}
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/mixin/CarriageContraptionMixin.java <<'EOF'
+          package com.multibogey.mixin;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Unique;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Constant;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.ModifyConstant;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          import com.multibogey.BogeyGroupAccess;
+          import com.multibogey.Config;
+          import com.multibogey.GroupOverrides;
+          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlock;
+          import com.simibubi.create.content.trains.entity.CarriageContraption;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.world.level.Level;
+
+          import com.simibubi.create.content.contraptions.Contraption;
+          import net.minecraft.nbt.CompoundTag;
+          import net.minecraft.world.level.block.entity.BlockEntity;
+          import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
+
+          @Mixin(value = CarriageContraption.class, remap = false)
+          public abstract class CarriageContraptionMixin implements BogeyGroupAccess {
+              @Unique
+              private final List<BlockPos> multibogey$bogeys = new ArrayList<>();
+
+              // Create: "if (bogeys > 2) throw too_many_bogeys" -> configurable limit
+              @ModifyConstant(method = "assemble", constant = @Constant(intValue = 2), remap = false)
+              private int multibogey$limit(int original) {
+                  return Config.maxBogeys();
+              }
+
+              // remember every bogey block that gets glued into this carriage
+              @Inject(method = "capture", at = @At("HEAD"), remap = false)
+              private void multibogey$track(Level world, BlockPos pos, CallbackInfoReturnable<?> cir) {
+                  if (world.getBlockState(pos).getBlock() instanceof AbstractBogeyBlock<?>) {
+                      multibogey$bogeys.add(pos);
+                  }
+              }
+
+              // the station tells us which bogey really is this carriage's rear bogey
+              @Inject(method = "getSecondBogeyPos", at = @At("RETURN"), cancellable = true, remap = false)
+              private void multibogey$second(CallbackInfoReturnable<BlockPos> cir) {
+                  if (multibogey$bogeys.isEmpty()) return;
+                  BlockPos first = multibogey$bogeys.get(0);
+                  if (GroupOverrides.SECOND.containsKey(first)) {
+                      cir.setReturnValue(GroupOverrides.SECOND.get(first));
+                  }
+              }
+
+              // Create strips the block entity of every bogey it captures, because it only expects two
+              // bogeys per carriage and renders those itself. Extra bogeys in between therefore had no
+              // block entity and showed up as a bare slab. Give them their block entity back so they
+              // render with their wheels/frame and keep their style when the train is disassembled.
+              @Inject(method = "assemble", at = @At("RETURN"), remap = false)
+              private void multibogey$keepMiddle(Level world, BlockPos pos, CallbackInfoReturnable<Boolean> cir) {
+                  if (!Boolean.TRUE.equals(cir.getReturnValue())) return;
+                  if (multibogey$bogeys.size() < 3) return;
+                  Contraption self = (Contraption) (Object) this;
+                  BlockPos first = multibogey$bogeys.get(0);
+                  BlockPos second = GroupOverrides.SECOND.containsKey(first)
+                      ? GroupOverrides.SECOND.get(first)
+                      : multibogey$bogeys.get(multibogey$bogeys.size() - 1);
+                  for (BlockPos p : multibogey$bogeys) {
+                      if (p.equals(first) || p.equals(second)) continue;
+                      BlockPos local = p.subtract(self.anchor);
+                      StructureTemplate.StructureBlockInfo info = self.getBlocks().get(local);
+                      BlockEntity be = world.getBlockEntity(p);
+                      if (info == null || be == null) continue;
+                      CompoundTag tag = be.saveWithFullMetadata(world.registryAccess());
+                      tag.remove("x");
+                      tag.remove("y");
+                      tag.remove("z");
+                      self.getBlocks().put(local, new StructureTemplate.StructureBlockInfo(local, info.state(), tag));
+                  }
+              }
+
+              @Override
+              public List<BlockPos> multibogey$getBogeyPositions() {
+                  return multibogey$bogeys;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/mixin/StationBlockEntityMixin.java <<'EOF'
+          package com.multibogey.mixin;
+
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.UUID;
+
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+          import org.spongepowered.asm.mixin.Unique;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          import com.multibogey.BogeyGroupAccess;
+          import com.multibogey.GroupOverrides;
+          import com.simibubi.create.content.contraptions.AssemblyException;
+          import com.simibubi.create.content.trains.bogey.AbstractBogeyBlock;
+          import com.simibubi.create.content.trains.entity.CarriageContraption;
+          import com.simibubi.create.content.trains.station.StationBlockEntity;
+          import com.simibubi.create.content.trains.track.ITrackBlock;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.state.BlockState;
+
+          @Mixin(value = StationBlockEntity.class, remap = false)
+          public abstract class StationBlockEntityMixin {
+              @Shadow int[] bogeyLocations;
+              @Shadow AbstractBogeyBlock<?>[] bogeyTypes;
+              @Shadow boolean[] upsideDownBogeys;
+              @Shadow int bogeyCount;
+
+              /**
+               * Create pairs every on-track bogey into carriages of max. 2 bogeys, so a 3rd bogey
+               * became a phantom "Carriage 2". Here we find which on-track bogeys are glued to the
+               * same blocks and keep only the first and last one of each group, the ones in
+               * between stay part of the carriage as normal blocks.
+               */
+              @Inject(method = "assemble(Ljava/util/UUID;)V",
+                  at = @At(value = "INVOKE",
+                      target = "Lcom/simibubi/create/content/trains/station/StationBlockEntity;refreshAssemblyInfo()V",
+                      shift = At.Shift.AFTER),
+                  remap = false)
+              private void multibogey$group(UUID playerUUID, CallbackInfo ci) {
+                  GroupOverrides.SECOND.clear();
+                  StationBlockEntity self = (StationBlockEntity) (Object) this;
+                  Level level = self.getLevel();
+                  if (level == null || bogeyLocations == null || bogeyTypes == null || upsideDownBogeys == null
+                      || bogeyCount <= 0 || !self.edgePoint.hasValidTrack()) {
+                      return;
+                  }
+                  Direction dir = self.getAssemblyDirection();
+                  if (dir == null) return;
+
+                  BlockPos trackPos = self.edgePoint.getGlobalPosition();
+                  BlockState trackState = self.edgePoint.getTrackBlockState();
+                  ITrackBlock track = self.edgePoint.getTrack();
+                  BlockPos up = BlockPos.containing(track.getUpNormal(level, trackPos, trackState));
+                  BlockPos down = new BlockPos(up.getX(), -up.getY(), up.getZ());
+
+                  BlockPos[] pos = new BlockPos[bogeyCount];
+                  for (int j = 0; j < bogeyCount; j++) {
+                      BlockPos base = upsideDownBogeys[j] ? trackPos.offset(down) : trackPos.offset(up);
+                      pos[j] = base.relative(dir, bogeyLocations[j] + 1);
+                  }
+
+                  List<Integer> keep = new ArrayList<>();
+                  Map<BlockPos, BlockPos> overrides = new HashMap<>();
+                  int i = 0;
+                  while (i < bogeyCount) {
+                      List<BlockPos> group = multibogey$probe(level, dir, pos[i]);
+                      if (group == null) return; // let Create report the real problem
+                      int last = i;
+                      while (last + 1 < bogeyCount && group.contains(pos[last + 1])) last++;
+                      for (int j = last + 1; j < bogeyCount; j++) {
+                          if (group.contains(pos[j])) return; // genuinely out of order: keep Create's error
+                      }
+                      keep.add(i);
+                      if (last != i) keep.add(last);
+                      overrides.put(pos[i], last != i ? pos[last] : null);
+                      i = last + 1;
+                  }
+
+                  int[] oldLoc = bogeyLocations.clone();
+                  AbstractBogeyBlock<?>[] oldTypes = bogeyTypes.clone();
+                  boolean[] oldUp = upsideDownBogeys.clone();
+                  Arrays.fill(bogeyLocations, -1);
+                  Arrays.fill(bogeyTypes, null);
+                  Arrays.fill(upsideDownBogeys, false);
+                  for (int k = 0; k < keep.size(); k++) {
+                      int from = keep.get(k);
+                      bogeyLocations[k] = oldLoc[from];
+                      bogeyTypes[k] = oldTypes[from];
+                      upsideDownBogeys[k] = oldUp[from];
+                  }
+                  bogeyCount = keep.size();
+                  GroupOverrides.SECOND.putAll(overrides);
+              }
+
+              @Inject(method = "assemble(Ljava/util/UUID;)V", at = @At("RETURN"), remap = false)
+              private void multibogey$clear(UUID playerUUID, CallbackInfo ci) {
+                  GroupOverrides.SECOND.clear();
+              }
+
+              @Unique
+              private static List<BlockPos> multibogey$probe(Level level, Direction dir, BlockPos start) {
+                  CarriageContraption c = new CarriageContraption(dir);
+                  try {
+                      c.assemble(level, start);
+                  } catch (AssemblyException ignored) {
+                      // structure was still scanned; Create reports the error itself later
+                  } catch (RuntimeException e) {
+                      return null;
+                  }
+                  return ((BogeyGroupAccess) (Object) c).multibogey$getBogeyPositions();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/RealBogeys.java <<'EOF'
+          package com.multibogey;
+
+          import java.util.List;
+
+          import com.simibubi.create.AllBlocks;
+          import com.simibubi.create.AllBogeyStyles;
+          import com.simibubi.create.content.trains.bogey.BogeySizes;
+          import com.simibubi.create.content.trains.bogey.BogeyStyle;
+
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.ResourceLocation;
+
+          /** Five bogey styles with real-world axle layouts, built from Create's own models and textures. */
+          public final class RealBogeys {
+              public record Spec(String id, float[] smallAxles, boolean smallFrame, float[] largeAxles, boolean largeFrame) {}
+
+              public static final List<Spec> SPECS = List.of(
+                  new Spec("jacobs",       new float[] {0f},              true,  new float[] {0f},          true),
+                  new Spec("y25",          new float[] {-1f, 1f},         false, new float[] {-.8f, .8f},   false),
+                  new Spec("type_c",       new float[] {-1f, 0f, 1f},     true,  new float[] {-.8f, .8f},   true),
+                  new Spec("commonwealth", new float[] {-1f, 0f, 1f},     false, new float[] {-.8f, .8f},   true),
+                  new Spec("buckeye",      new float[] {-.5f, .5f},       true,  new float[] {0f},          false)
+              );
+
+              private RealBogeys() {}
+
+              public static void register() {
+                  for (Spec s : SPECS) {
+                      ResourceLocation id = ResourceLocation.fromNamespaceAndPath("multibogey", s.id());
+                      new BogeyStyle.Builder(id, AllBogeyStyles.STANDARD_CYCLE_GROUP)
+                          .displayName(Component.translatable("multibogey.bogey.style." + s.id()))
+                          .size(BogeySizes.SMALL, AllBlocks.SMALL_BOGEY, () -> () -> new BogeyStyle.SizeRenderer(
+                              new RealBogeyRenderer(s, false),
+                              (ctx, pt, inContraption) -> new RealBogeyVisual(s, false, ctx, pt, inContraption)))
+                          .size(BogeySizes.LARGE, AllBlocks.LARGE_BOGEY, () -> () -> new BogeyStyle.SizeRenderer(
+                              new RealBogeyRenderer(s, true),
+                              (ctx, pt, inContraption) -> new RealBogeyVisual(s, true, ctx, pt, inContraption)))
+                          .build();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/RealBogeyRenderer.java <<'EOF'
+          package com.multibogey;
+
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.mojang.blaze3d.vertex.VertexConsumer;
+          import com.simibubi.create.AllPartialModels;
+          import com.simibubi.create.content.trains.bogey.StandardBogeyRenderer;
+
+          import net.createmod.catnip.render.CachedBuffers;
+          import net.createmod.catnip.render.SuperByteBuffer;
+          import net.minecraft.client.renderer.MultiBufferSource;
+          import net.minecraft.client.renderer.RenderType;
+          import net.minecraft.nbt.CompoundTag;
+          import net.minecraft.world.level.block.Blocks;
+
+          public class RealBogeyRenderer extends StandardBogeyRenderer {
+              private final RealBogeys.Spec spec;
+              private final boolean large;
+
+              public RealBogeyRenderer(RealBogeys.Spec spec, boolean large) {
+                  this.spec = spec;
+                  this.large = large;
+              }
+
+              @Override
+              public void render(CompoundTag bogeyData, float wheelAngle, float partialTick, PoseStack poseStack,
+                                 MultiBufferSource bufferSource, int light, int overlay, boolean inContraption) {
+                  super.render(bogeyData, wheelAngle, partialTick, poseStack, bufferSource, light, overlay, inContraption);
+                  VertexConsumer buffer = bufferSource.getBuffer(RenderType.cutoutMipped());
+
+                  float[] axles = large ? spec.largeAxles() : spec.smallAxles();
+                  boolean frame = large ? spec.largeFrame() : spec.smallFrame();
+
+                  if (frame) {
+                      CachedBuffers.partial(large ? AllPartialModels.BOGEY_DRIVE : AllPartialModels.BOGEY_FRAME,
+                              Blocks.AIR.defaultBlockState())
+                          .scale(1 - 1 / 512f)
+                          .light(light)
+                          .overlay(overlay)
+                          .renderInto(poseStack, buffer);
+                  }
+
+                  SuperByteBuffer wheels = CachedBuffers.partial(
+                      large ? AllPartialModels.LARGE_BOGEY_WHEELS : AllPartialModels.SMALL_BOGEY_WHEELS,
+                      Blocks.AIR.defaultBlockState());
+                  for (float z : axles) {
+                      wheels.translate(0, large ? 1f : 12 / 16f, z)
+                          .rotateXDegrees(wheelAngle)
+                          .light(light)
+                          .overlay(overlay)
+                          .renderInto(poseStack, buffer);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/multibogey/RealBogeyVisual.java <<'EOF'
+          package com.multibogey;
+
+          import java.util.function.Consumer;
+
+          import org.jetbrains.annotations.Nullable;
+
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.simibubi.create.AllPartialModels;
+          import com.simibubi.create.content.trains.bogey.StandardBogeyVisual;
+          import com.simibubi.create.foundation.render.SpecialModels;
+
+          import dev.engine_room.flywheel.api.instance.Instance;
+          import dev.engine_room.flywheel.api.visualization.VisualizationContext;
+          import dev.engine_room.flywheel.lib.instance.InstanceTypes;
+          import dev.engine_room.flywheel.lib.instance.TransformedInstance;
+          import net.minecraft.nbt.CompoundTag;
+
+          public class RealBogeyVisual extends StandardBogeyVisual {
+              private final boolean large;
+              private final float[] axles;
+              private final TransformedInstance frame;
+              private final TransformedInstance[] wheels;
+
+              public RealBogeyVisual(RealBogeys.Spec spec, boolean large, VisualizationContext ctx, float partialTick,
+                                     boolean inContraption) {
+                  super(ctx, partialTick, inContraption);
+                  this.large = large;
+                  this.axles = large ? spec.largeAxles() : spec.smallAxles();
+
+                  var wheelInstancer = ctx.instancerProvider().instancer(InstanceTypes.TRANSFORMED,
+                      SpecialModels.smoothLit(large ? AllPartialModels.LARGE_BOGEY_WHEELS : AllPartialModels.SMALL_BOGEY_WHEELS));
+                  wheels = new TransformedInstance[axles.length];
+                  for (int i = 0; i < wheels.length; i++) {
+                      wheels[i] = wheelInstancer.createInstance();
+                  }
+
+                  boolean hasFrame = large ? spec.largeFrame() : spec.smallFrame();
+                  frame = hasFrame
+                      ? ctx.instancerProvider().instancer(InstanceTypes.TRANSFORMED,
+                          SpecialModels.smoothLit(large ? AllPartialModels.BOGEY_DRIVE : AllPartialModels.BOGEY_FRAME))
+                          .createInstance()
+                      : null;
+              }
+
+              @Override
+              public void update(CompoundTag bogeyData, float wheelAngle, PoseStack poseStack) {
+                  super.update(bogeyData, wheelAngle, poseStack);
+                  for (int i = 0; i < wheels.length; i++) {
+                      wheels[i].setTransform(poseStack)
+                          .translate(0, large ? 1f : 12 / 16f, axles[i])
+                          .rotateXDegrees(wheelAngle)
+                          .setChanged();
+                  }
+                  if (frame != null) {
+                      frame.setTransform(poseStack).scale(1 - 1 / 512f).setChanged();
+                  }
+              }
+
+              @Override
+              public void hide() {
+                  super.hide();
+                  for (TransformedInstance w : wheels) w.setZeroTransform().setChanged();
+                  if (frame != null) frame.setZeroTransform().setChanged();
+              }
+
+              @Override
+              public void updateLight(int packedLight) {
+                  super.updateLight(packedLight);
+                  for (TransformedInstance w : wheels) w.light(packedLight).setChanged();
+                  if (frame != null) frame.light(packedLight).setChanged();
+              }
+
+              @Override
+              public void collectCrumblingInstances(Consumer<@Nullable Instance> consumer) {
+                  super.collectCrumblingInstances(consumer);
+                  for (TransformedInstance w : wheels) consumer.accept(w);
+                  if (frame != null) consumer.accept(frame);
+              }
+
+              @Override
+              public void delete() {
+                  super.delete();
+                  for (TransformedInstance w : wheels) w.delete();
+                  if (frame != null) frame.delete();
+              }
+          }
+          EOF
+
+          mkdir -p src/main/resources/assets/multibogey/lang
+          cat > src/main/resources/assets/multibogey/lang/en_us.json <<'EOF'
+          {
+            "multibogey.bogey.style.jacobs": "Jacobs Articulated (1 axle)",
+            "multibogey.bogey.style.y25": "Y25 Freight (2 axle)",
+            "multibogey.bogey.style.type_c": "Type C Co-Co (3 axle)",
+            "multibogey.bogey.style.commonwealth": "Commonwealth Passenger (6 wheel)",
+            "multibogey.bogey.style.buckeye": "Buckeye Freight (compact)"
+          }
+          EOF
+
+      - name: Generate icon
+        run: |
+          pip install pillow
+          python3 - <<'EOF'
+          from PIL import Image, ImageDraw
+          img = Image.new("RGBA", (128, 128), (40, 44, 52, 255))
+          d = ImageDraw.Draw(img)
+          d.rectangle([0, 92, 128, 98], fill=(120, 120, 130, 255))
+          for x in range(4, 128, 16):
+              d.rectangle([x, 98, x + 8, 106], fill=(110, 78, 46, 255))
+          d.rectangle([10, 44, 56, 78], fill=(200, 60, 50, 255))
+          d.rectangle([60, 44, 118, 78], fill=(60, 120, 200, 255))
+          d.rectangle([56, 58, 60, 64], fill=(230, 230, 230, 255))
+          for cx in (20, 34, 48, 72, 90, 108):
+              d.ellipse([cx - 6, 80, cx + 6, 92], fill=(30, 30, 30, 255), outline=(220, 220, 220, 255))
+          d.rectangle([20, 32, 30, 44], fill=(70, 70, 70, 255))
+          d.ellipse([18, 18, 34, 32], fill=(235, 235, 235, 200))
+          img.save("src/main/resources/logo.png")
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon -PcreateVersion="$CREATE_VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multibogey-mod
+          path: build/libs/*.jar
